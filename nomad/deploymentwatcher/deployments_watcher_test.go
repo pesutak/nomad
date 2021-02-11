@@ -1334,6 +1334,195 @@ func TestDeploymentWatcher_PromotedCanary_UpdatedAllocs(t *testing.T) {
 	})
 }
 
+func TestDeploymentWatcher_ProgressDeadline_LatePromote(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	mtype := structs.MsgTypeTestSetup
+
+	w, m := defaultTestDeploymentWatcher(t)
+	w.SetEnabled(true, m.state)
+
+	m.On("UpdateDeploymentStatus", mocker.MatchedBy(func(args *structs.DeploymentStatusUpdateRequest) bool {
+		return true
+	})).Return(nil).Maybe()
+
+	progressTimeout := time.Millisecond * 1000
+	j := mock.Job()
+	j.TaskGroups[0].Name = "group1"
+	j.TaskGroups[0].Update = structs.DefaultUpdateStrategy.Copy()
+	j.TaskGroups[0].Update.MaxParallel = 2
+	j.TaskGroups[0].Update.AutoRevert = false
+	j.TaskGroups[0].Update.ProgressDeadline = progressTimeout
+	j.TaskGroups = append(j.TaskGroups, j.TaskGroups[0].Copy())
+	j.TaskGroups[0].Name = "group2"
+
+	d := mock.Deployment()
+	d.JobID = j.ID
+	d.TaskGroups = map[string]*structs.DeploymentState{
+		"group1": {
+			ProgressDeadline: progressTimeout,
+			Promoted:         false,
+			PlacedCanaries:   []string{},
+			DesiredCanaries:  1,
+			DesiredTotal:     3,
+			PlacedAllocs:     0,
+			HealthyAllocs:    0,
+			UnhealthyAllocs:  0,
+		},
+		"group2": {
+			ProgressDeadline: progressTimeout,
+			Promoted:         false,
+			PlacedCanaries:   []string{},
+			DesiredCanaries:  1,
+			DesiredTotal:     3,
+			PlacedAllocs:     0,
+			HealthyAllocs:    0,
+			UnhealthyAllocs:  0,
+		},
+	}
+
+	require.NoError(m.state.UpsertJob(mtype, m.nextIndex(), j))
+	require.NoError(m.state.UpsertDeployment(m.nextIndex(), d))
+
+	// create canaries
+
+	now := time.Now()
+
+	canary1 := mock.Alloc()
+	canary1.Job = j
+	canary1.DeploymentID = d.ID
+	canary1.TaskGroup = "group1"
+	canary1.DesiredStatus = structs.AllocDesiredStatusRun
+	canary1.DeploymentStatus = &structs.AllocDeploymentStatus{
+		Canary: true, Timestamp: now}
+	canary1.ModifyTime = now.UnixNano()
+
+	canary2 := mock.Alloc()
+	canary2.Job = j
+	canary2.DeploymentID = d.ID
+	canary2.TaskGroup = "group2"
+	canary2.DesiredStatus = structs.AllocDesiredStatusRun
+	canary2.DeploymentStatus = &structs.AllocDeploymentStatus{
+		Canary: true, Timestamp: now}
+	canary2.ModifyTime = now.UnixNano()
+
+	allocs := []*structs.Allocation{canary1, canary2}
+	err := m.state.UpsertAllocs(mtype, m.nextIndex(), allocs)
+	require.NoError(err)
+
+	// mark the canaries healthy
+
+	now = time.Now()
+
+	canary1 = canary1.Copy()
+	canary2 = canary2.Copy()
+	canary1.DeploymentStatus = &structs.AllocDeploymentStatus{
+		Canary: true, Healthy: helper.BoolToPtr(true), Timestamp: now}
+	canary2.DeploymentStatus = &structs.AllocDeploymentStatus{
+		Canary: true, Healthy: helper.BoolToPtr(true), Timestamp: now}
+
+	allocs = []*structs.Allocation{canary1, canary2}
+	err = m.state.UpdateAllocsFromClient(mtype, m.nextIndex(), allocs)
+	require.NoError(err)
+
+	// ensure progress_deadline has definitely expired
+	time.Sleep(progressTimeout * 1)
+
+	// require that we get a call to UpsertDeploymentPromotion
+	matchConfig := &matchDeploymentPromoteRequestConfig{
+		Promotion: &structs.DeploymentPromoteRequest{
+			DeploymentID: d.ID,
+			All:          true,
+		},
+		Eval: true,
+	}
+	matcher := matchDeploymentPromoteRequest(matchConfig)
+	m.On("UpdateDeploymentPromotion", mocker.MatchedBy(matcher)).Return(nil).Run(func(args mocker.Arguments) {
+		fmt.Println(d.ID)
+		//		spew.Dump(d)
+	})
+
+	m1 := matchUpdateAllocDesiredTransitions([]string{d.ID})
+	m.On("UpdateAllocDesiredTransition", mocker.MatchedBy(m1)).Return(nil)
+
+	// promote the deployment
+	req := &structs.DeploymentPromoteRequest{
+		DeploymentID: d.ID,
+		All:          true,
+	}
+	err = w.PromoteDeployment(req, &structs.DeploymentUpdateResponse{})
+	require.NoError(err)
+
+	// create new allocs for promoted deployment
+
+	now = time.Now()
+
+	alloc1a := mock.Alloc()
+	alloc1a.Job = j
+	alloc1a.DeploymentID = d.ID
+	alloc1a.TaskGroup = "group1"
+	alloc1a.DesiredStatus = structs.AllocDesiredStatusRun
+	alloc1a.ModifyTime = now.UnixNano()
+
+	alloc2a := mock.Alloc()
+	alloc2a.Job = j
+	alloc2a.DeploymentID = d.ID
+	alloc2a.TaskGroup = "group2"
+	alloc2a.DesiredStatus = structs.AllocDesiredStatusRun
+	alloc2a.ModifyTime = now.UnixNano()
+
+	allocs = []*structs.Allocation{alloc1a, alloc2a}
+	err = m.state.UpsertAllocs(mtype, m.nextIndex(), allocs)
+	require.NoError(err)
+
+	// update group1 alloc status (set the clock)
+
+	now = time.Now()
+
+	alloc1a = alloc1a.Copy()
+	alloc1a.ClientStatus = structs.AllocClientStatusRunning
+	alloc1a.ModifyTime = now.UnixNano()
+	alloc1a.DeploymentStatus = &structs.AllocDeploymentStatus{
+		Canary:    false,
+		Healthy:   helper.BoolToPtr(true),
+		Timestamp: now,
+	}
+
+	allocs = []*structs.Allocation{alloc1a}
+	err = m.state.UpdateAllocsFromClient(mtype, m.nextIndex(), allocs)
+	require.NoError(err)
+
+	// update group2 alloc status(causes failure for #7058)
+
+	alloc2a = alloc2a.Copy()
+	alloc2a.ClientStatus = structs.AllocClientStatusRunning
+	alloc2a.ModifyTime = now.UnixNano()
+	alloc2a.DeploymentStatus = &structs.AllocDeploymentStatus{
+		Canary:    false,
+		Healthy:   helper.BoolToPtr(true),
+		Timestamp: now,
+	}
+
+	allocs = []*structs.Allocation{alloc2a}
+	err = m.state.UpdateAllocsFromClient(mtype, m.nextIndex(), allocs)
+	require.NoError(err)
+
+	// TODO finish updates to make deployment successful
+
+	testutil.WaitForResult(
+		func() (bool, error) {
+			deployment, err := m.state.DeploymentByID(nil, d.ID)
+			ok := deployment.Status == structs.DeploymentStatusSuccessful && err == nil
+			if !ok {
+				err = fmt.Errorf("expected successful deployment, got %q: desc=%q, error=%v",
+					deployment.Status, deployment.StatusDescription, err)
+			}
+			return ok, err
+		},
+		func(err error) { require.NoError(err) },
+	)
+}
+
 // Test scenario where deployment initially has no progress deadline
 // After the deployment is updated, a failed alloc's DesiredTransition should be set
 func TestDeploymentWatcher_Watch_StartWithoutProgressDeadline(t *testing.T) {
